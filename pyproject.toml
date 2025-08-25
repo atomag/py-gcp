@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-gcp"
+version = "0.1.0"
+description = "Pure-Python/NumPy/Torch implementation of Geometrical Counterpoise (gCP)"
+authors = [{name = "Lynd", email = "noreply@example.com"}]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "numpy>=1.21",
+  "numba>=0.55",
+]
+keywords = ["gcp", "BSSE", "quantum-chemistry", "DFT", "HF", "ASE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/atomag/py-gcp"
+Issues = "https://github.com/atomag/py-gcp/issues"
+
+[project.optional-dependencies]
+torch = ["torch>=1.13"]
+ase = ["ase>=3.22.1"]
+
+[project.scripts]
+pygcp = "py_gcp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["py_gcp*"]
+exclude = ["fgcp*", "tests*", "__pycache__*"]
+
+[tool.setuptools.package-data]
+"py_gcp" = ["data/fortran_params.json"]
