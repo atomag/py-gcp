@@ -11,10 +11,7 @@ It provides:
 ## Install
 
 ```
-pip install py-gcp
-# optional extras
-pip install py-gcp[ase]
-pip install py-gcp[torch]
+pip install ./
 ```
 
 ## Quick start
@@ -59,30 +56,31 @@ E_eV = at.get_potential_energy()
 
 ## Brief theory
 
+
 The gCP correction adds a pairwise term to approximate the residual BSSE of a finite basis calculation.
 For a molecule, the energy is
 
-\[
+$$
 E_\mathrm{gCP} = p_1 \sum_i \epsilon(Z_i) \sum_{j\ne i}
 \frac{\exp\big(-p_3\, r_{ij}^{\,p_4}\big)}{\sqrt{\,v_j\, s_{ab}(r_{ij}; Z_i,Z_j)\,}},
-\]
+$$
 
 where
 
-- \(\epsilon(Z)\) is the per‑element emissivity (method dependent),
-- \(v_j = n_\mathrm{bas}(Z_j) - \tfrac{1}{2}Z_j\) is the virtual count (with specific overrides for some 3c variants),
-- \(s_{ab}(r; Z_i,Z_j)\) is the s‑type Slater overlap between the valence shells (1s/2s/3s) of \(Z_i\) and \(Z_j\) with exponents \(\zeta_a,\zeta_b\) from `setzet`,
-- and \(p_1, p_2, p_3, p_4\) are the method parameters (\(p_2\) is the scaling for \(\zeta\)).
+- $\epsilon(Z)$ is the per‑element emissivity (method dependent),
+- $v_j = n_\mathrm{bas}(Z_j) - \tfrac{1}{2}Z_j$ is the virtual count (with specific overrides for some 3c variants),
+- $s_{ab}(r; Z_i,Z_j)$ is the s‑type Slater overlap between the valence shells (1s/2s/3s) of $Z_i$ and $Z_j$ with exponents $\zeta_a,\zeta_b$ from `setzet`,
+- and $p_1, p_2, p_3, p_4$ are the method parameters ($p_2$ is the scaling for $\zeta$).
 
-The Slater overlap \(s_{ab}\) is evaluated analytically with auxiliary functions \(A_k(x)\), \(B_k(x)\) and a robust small‑\(x\) series for \(B_k\). For PBC, the pair sum is extended over lattice images within a fixed cutoff (60 Bohr).
+The Slater overlap $s_{ab}$ is evaluated analytically with auxiliary functions $A_k(x)$, $B_k(x)$ and a robust small‑$x$ series for $B_k$. For PBC, the pair sum is extended over lattice images within a fixed cutoff (60 Bohr).
 
 For damped 3c variants (e.g., PBEh‑3c, HSE‑3c, mTZVPP), we multiply the pair contribution by a short‑range damping function
 
-\[\displaystyle
+$$
 f_\mathrm{damp}(r) = 1 - \frac{1}{1 + d_\mathrm{scal}\, (r/r_0)^{d_\mathrm{exp}}}, \quad r_0 = r_0^{\,(Z_i,Z_j)}
-\]
+$$
 
-with element‑pair radii \(r_0\) tabulated and packed in the distribution.
+with element‑pair radii $r_0$ tabulated and packed in the distribution.
 
 Units: Coordinates are accepted in Angstrom or Bohr; energy is returned in Hartree (CLI also prints kcal/mol).
 
@@ -95,4 +93,8 @@ Units: Coordinates are accepted in Angstrom or Bohr; energy is returned in Hartr
 ## Development
 
 - Run tests: `pip install -e .[ase] pytest` then `pytest -q`.
-- Benchmarks: `python3 bench_suite.py` (NumPy vs gcp64), `python3 bench_torch_modes.py`.
+- Benchmarks: `python3 tools/bench_suite.py` (NumPy vs gcp64), `python3 tools/bench_torch_modes.py`.
+- Update params from Fortran (optional, for extended Z support):
+  - Obtain the upstream Fortran source (e.g., `gcp.f90`).
+  - Run: `python3 tools/extract_fortran_params.py /path/to/gcp.f90 -o py_gcp/data/fortran_params.json`
+  - This refreshes arrays like `ZS/ZP/ZD/SHELL` so py-gcp can build sqrt(sab) tables beyond Z=36.

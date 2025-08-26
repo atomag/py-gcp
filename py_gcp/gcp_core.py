@@ -31,7 +31,14 @@ try:
     import torch
     _HAVE_TORCH = True
 except Exception:  # pragma: no cover
+    # Torch not available – provide a minimal stub for decorators used at import time
     _HAVE_TORCH = False
+    class _TorchStub:
+        def no_grad(self, *args, **kwargs):
+            def _decorator(fn):
+                return fn
+            return _decorator
+    torch = _TorchStub()  # type: ignore
 
 try:  # optional CPU JIT acceleration
     from numba import njit
@@ -133,13 +140,17 @@ ZD = np.array([
 
 
 # Shell mapping per element (1s, 2s, 3s treated as 1,2,3)
-_SHELL = np.array([
-    1, 1,                 # H, He
-    2,2,2,2,2,2,2,2,       # Li-Ne
-    3,3,3,3,3,3,3,3,       # Na-Ar
-    # K-Rn treated as 3s in this model (no explicit 4s/5s here)
-    *([3] * (36 - 18))
-], dtype=np.int32)
+def _default_shell(n: int) -> np.ndarray:
+    arr = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        z = i + 1
+        if z <= 2:
+            arr[i] = 1
+        elif z <= 10:
+            arr[i] = 2
+        else:
+            arr[i] = 3
+    return arr
 
 
 @dataclass
@@ -209,13 +220,13 @@ def _arr(name: str) -> np.ndarray:
     if name == 'HFsvp':
         return HFsvp.copy()
     if name == 'HFtz':
-        return _load_fortran_array(name, dtype=float)
+        return HFtz.copy()
     if name == 'BASsv':
         return BASsv.copy()
     if name == 'BASsvp':
         return BASsvp.copy()
     if name == 'BAStz':
-        return _load_fortran_array(name, dtype=int)
+        return BAStz.copy().astype(np.int32)
     # Others: load from Fortran (return copies to avoid mutating cache)
     if name.upper().startswith('BAS'):
         return _load_fortran_array(name, dtype=int).copy()
@@ -248,19 +259,37 @@ def _method_options(method: str) -> MethodOptions:
     return MethodOptions()
 
 
-def _load_r0ab_matrix(max_elem: int = 36) -> np.ndarray:
+def _load_r0ab_matrix(max_elem: int | None = None) -> np.ndarray:
     data = _load_param_json()
     vals = data.get('r0ab_vals', [])
+    # Deduce size N from triangular length if not provided
+    if max_elem is None:
+        L = int(len(vals))
+        # Solve N(N+1)/2 = L
+        import math as _math
+        N = int((_math.isqrt(1 + 8 * L) - 1) // 2)
+    else:
+        N = int(max_elem)
     AUTOANG = 0.5291772083
-    r = np.zeros((max_elem, max_elem), dtype=np.float64)
+    r = np.zeros((N, N), dtype=np.float64)
     k = 0
-    for i in range(max_elem):
+    for i in range(N):
         for j in range(i + 1):
             v = vals[k] / AUTOANG
             r[i, j] = v
             r[j, i] = v
             k += 1
     return r
+
+# Initialize SHELL after loaders are available
+try:
+    _SHELL = _load_fortran_array('SHELL', dtype=int).astype(np.int32)
+    ZS_len = int(_load_fortran_array('ZS').size)
+    if _SHELL.ndim != 1 or _SHELL.size < ZS_len:
+        raise ValueError
+except Exception:
+    ZS_len = int(_load_fortran_array('ZS').size) if 'ZS' in _load_param_json().get('arrays', {}) else 36
+    _SHELL = _default_shell(ZS_len)
 
 
 def _params_for_method(method: str) -> GCPParams:
@@ -351,15 +380,22 @@ def _params_for_method(method: str) -> GCPParams:
         nbas[4 - 1] = 5
     if m in ('hf3c',):
         # Reproduce Fortran setparam('hf/minix','hf3c') exactly for Z<=36
-        HFminis = _arr('HFminis')
-        BASminis = _arr('BASminis').astype(np.int32)
-        HFminisd = _arr('HFminisd')
-        BASminisd = _arr('BASminisd').astype(np.int32)
+        # Allocate fresh arrays of length 36
+        emiss = np.zeros(36, dtype=np.float64)
+        nbas = np.zeros(36, dtype=np.int32)
+        def _pad36(a: np.ndarray, dtype=float) -> np.ndarray:
+            out = np.zeros(36, dtype=np.float64 if dtype is float else np.int32)
+            n = min(36, int(a.size))
+            out[:n] = a[:n]
+            if dtype is int:
+                return out.astype(np.int32)
+            return out
+        HFminis = _pad36(_arr('HFminis'), float)
+        BASminis = _pad36(_arr('BASminis').astype(np.int32), int)
+        HFminisd = _pad36(_arr('HFminisd'), float)
+        BASminisd = _pad36(_arr('BASminisd').astype(np.int32), int)
         BASsv_arr = _arr('BASsv').astype(np.int32)
         BASsvp_arr = _arr('BASsvp').astype(np.int32)
-        # Start clean
-        emiss[:] = 0.0
-        nbas[:] = 0
         # H-Mg: MINIS
         emiss[0:12] = HFminis[0:12]
         nbas[0:12] = BASminis[0:12]
@@ -397,21 +433,51 @@ def _params_for_method(method: str) -> GCPParams:
     return GCPParams(emiss, nbas, p)
 
 
-def _setzet(eta: float, etaspec: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute Slater exponents za, zb for Z=1..36.
-    Matches Fortran setzet for etaspec=1.0 (no special r2scan-3c scaling).
+def _map_elements_for_params(Z: np.ndarray) -> np.ndarray:
+    """Map elements >36 to lower homologues as in Fortran gcp.f90.
+
+    Cases (zz original Z):
+      37..54 -> zz-18
+      55..57 -> zz-36
+      58..71, 90..94 -> 21
+      72..89 -> zz-50
+      otherwise unchanged.
     """
-    za = np.empty(36, dtype=np.float64)
-    for i in range(36):
+    Z = np.asarray(Z, dtype=np.int32).copy()
+    zz = Z.copy()
+    mask = (zz >= 37) & (zz <= 54)
+    Z[mask] = zz[mask] - 18
+    mask = (zz >= 55) & (zz <= 57)
+    Z[mask] = zz[mask] - 36
+    mask = ((zz >= 58) & (zz <= 71)) | ((zz >= 90) & (zz <= 94))
+    Z[mask] = 21
+    mask = (zz >= 72) & (zz <= 89)
+    Z[mask] = zz[mask] - 50
+    return Z
+
+def _setzet(eta: float, etaspec: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute Slater exponents za, zb per element.
+
+    Uses arrays ZS/ZP/ZD from packaged data if available; falls back
+    to embedded defaults. Applies etaspec to indices >= 11 (1-based),
+    mirroring Fortran setzet behavior used in gcp.
+    """
+    ZS_arr = _arr('ZS')
+    ZP_arr = _arr('ZP')
+    ZD_arr = _arr('ZD') if 'ZD' in _load_param_json().get('arrays', {}) else np.zeros_like(ZS_arr)
+    n = int(ZS_arr.shape[0])
+    za = np.empty(n, dtype=np.float64)
+    for i in range(n):
         z = i + 1
         if z <= 2:
-            base = ZS[i]
+            base = ZS_arr[i]
         elif 3 <= z <= 20 or z >= 31:
-            base = 0.5 * (ZS[i] + ZP[i])
+            base = 0.5 * (ZS_arr[i] + ZP_arr[i])
         else:  # 21..30
-            base = (ZS[i] + ZP[i] + ZD[i]) / 3.0
+            base = (ZS_arr[i] + ZP_arr[i] + ZD_arr[i]) / 3.0
         za[i] = base
-    za[10:36] *= etaspec  # indices 11..36 in Fortran (0-based 10..35)
+    if n > 10:
+        za[10:] *= etaspec  # indices 11..n (Fortran 1-based 11..)
     za *= eta
     zb = za.copy()
     return za, zb
@@ -429,16 +495,17 @@ def _build_sqrt_sab_table(p2: float, thrR: float = 60.0, ngrid: int = 2048) -> T
         return _SAB_TABLE_CACHE[key]
     za_tab, zb_tab = _setzet(p2, 1.0)
     shell = _SHELL
+    nZ = int(min(za_tab.size, shell.size))
     dr = thrR / float(max(1, ngrid - 1))
     grid = np.linspace(0.0, thrR, ngrid, dtype=np.float64)
     if ngrid > 0:
         grid[0] = 1e-8  # avoid r=0 singularities in special functions
-    sqrt_tab = np.zeros((36, 36, ngrid), dtype=np.float64)
-    for i in range(36):
+    sqrt_tab = np.zeros((nZ, nZ, ngrid), dtype=np.float64)
+    for i in range(nZ):
         zi = i + 1
         si = int(shell[zi - 1])
         za = float(za_tab[zi - 1])
-        for j in range(36):
+        for j in range(nZ):
             zj = j + 1
             sj = int(shell[zj - 1])
             zb = float(zb_tab[zj - 1])
@@ -1575,6 +1642,7 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
         latb = lat.copy()
     # SRB-only short-circuit
     opts = _method_options(method)
+    Zm = _map_elements_for_params(Z)
     if opts.srb:
         r0ab = _load_r0ab_matrix()
         t1, t2, t3 = _tau_max_from_lat(latb, 30.0)
@@ -1584,17 +1652,17 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
             tvecs = _filter_tvecs_by_bound(tvecs, xyzb.astype(np.float64), 30.0)
             M = int(tvecs.shape[0])
             N = int(Z.shape[0])
-            # Pair factors
-            z = np.arange(1, 37, dtype=np.float64)
+            # Pair factors (cover all available r0ab elements)
+            z = np.arange(1, r0ab.shape[0] + 1, dtype=np.float64)
             zz = np.sqrt(z[:,None] * z[None,:])
             r0fac = (float(opts.srb_rscal)) / r0ab.astype(np.float64)
             ff = -(zz * float(opts.srb_qscal))
             # Heuristic switch: small systems → loop; larger → SoA vec
             if M * N < 50000:
-                return float(_srb_energy_nb_pbc(Z.astype(np.int32), xyzb.astype(np.float64), latb.astype(np.float64), r0ab.astype(np.float64), float(opts.srb_rscal), float(opts.srb_qscal), 30.0, int(t1), int(t2), int(t3)))
+                return float(_srb_energy_nb_pbc(Zm.astype(np.int32), xyzb.astype(np.float64), latb.astype(np.float64), r0ab.astype(np.float64), float(opts.srb_rscal), float(opts.srb_qscal), 30.0, int(t1), int(t2), int(t3)))
             tvx, tvy, tvz = _split_tvecs(tvecs)
             x, y, zc = _split_coords(xyzb.astype(np.float64))
-            return float(_srb_energy_nb_pbc_vec_soa(Z.astype(np.int32), x, y, zc, tvx, tvy, tvz, r0fac.astype(np.float64), ff.astype(np.float64), 30.0))
+            return float(_srb_energy_nb_pbc_vec_soa(Zm.astype(np.int32), x, y, zc, tvx, tvy, tvz, r0fac.astype(np.float64), ff.astype(np.float64), 30.0))
         # Fallback non-JIT using symmetric image set (no 0.5 factor)
         e = 0.0
         n = int(Z.shape[0])
@@ -1602,12 +1670,12 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
         tvecs = _build_half_tvecs(latb.astype(np.float64), int(t1), int(t2), int(t3))
         tvecs = _filter_tvecs_by_bound(tvecs, xyzb.astype(np.float64), 30.0)
         for i in range(n):
-            zi = int(Z[i])
+            zi = int(Zm[i])
             # Non-zero images
             for m in range(tvecs.shape[0]):
                 t = tvecs[m]
                 for j in range(n):
-                    zj = int(Z[j])
+                    zj = int(Zm[j])
                     rij = xyzb[i] - (xyzb[j] + t)
                     r = float(np.linalg.norm(rij))
                     if r > 30.0:
@@ -1617,7 +1685,7 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
                     e += opts.srb_qscal * ff * math.exp(-r0 * r)
             # Zero image (upper triangle)
             for j in range(i+1, n):
-                zj = int(Z[j])
+                zj = int(Zm[j])
                 rij = xyzb[i] - xyzb[j]
                 r = float(np.linalg.norm(rij))
                 if r > 30.0:
@@ -1631,6 +1699,13 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
     emiss = params.emiss
     nbas = params.nbas
     p1, p2, p3, p4 = params.p
+    # No hard error for Z>emiss.size; Fortran maps elements to lower homologues
+    # Pad emiss/nbas so kernels can index safely for mapped Z
+    maxZ = int(np.max(Zm)) if Zm.size else 0
+    if emiss.size < maxZ:
+        emiss = np.pad(emiss, (0, maxZ - emiss.size), mode='constant', constant_values=0.0)
+    if nbas.size < maxZ:
+        nbas = np.pad(nbas.astype(np.int32), (0, maxZ - nbas.size), mode='constant', constant_values=0).astype(np.int32)
     shell = _SHELL
     za_tab, zb_tab = _setzet(p2, 1.0)
     thrR = 60.0
@@ -1638,13 +1713,13 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
     t1, t2, t3 = _tau_max_from_lat(latb, thrR)
     if _HAVE_NUMBA:
         if not opts.damp:
-            gcp = float(_gcp_energy_nb_pbc(Z.astype(np.int32), xyzb.astype(np.float64), emiss.astype(np.float64), nbas.astype(np.int32), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE), latb.astype(np.float64), int(t1), int(t2), int(t3)))
+            gcp = float(_gcp_energy_nb_pbc(Zm.astype(np.int32), xyzb.astype(np.float64), emiss.astype(np.float64), nbas.astype(np.int32), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE), latb.astype(np.float64), int(t1), int(t2), int(t3)))
         else:
             N = int(Z.shape[0])
             xva = np.empty(N, dtype=np.float64)
             special_xva = _normalize_method(method) in ('def2mtzvpp', 'mtzvpp', 'r2scan3c')
             for i in range(N):
-                zi = int(Z[i])
+                zi = int(Zm[i])
                 if special_xva:
                     val = 1.0
                     if zi == 6:
@@ -1656,7 +1731,7 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
                     xva[i] = float(nbas[zi - 1]) - 0.5 * float(zi)
             xvb = xva.copy()
             r0ab = _load_r0ab_matrix()
-            gcp = float(_gcp_energy_nb_damped_pbc(Z.astype(np.int32), xyzb.astype(np.float64), emiss.astype(np.float64), xva.astype(np.float64), xvb.astype(np.float64), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE), latb.astype(np.float64), int(t1), int(t2), int(t3), r0ab.astype(np.float64), float(opts.dmp_scal), float(opts.dmp_exp)))
+            gcp = float(_gcp_energy_nb_damped_pbc(Zm.astype(np.int32), xyzb.astype(np.float64), emiss.astype(np.float64), xva.astype(np.float64), xvb.astype(np.float64), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE), latb.astype(np.float64), int(t1), int(t2), int(t3), r0ab.astype(np.float64), float(opts.dmp_scal), float(opts.dmp_exp)))
         if opts.base:
             # add base PBC short-range; prefer vectorized JIT
             if 'r0ab' not in locals():
@@ -1666,18 +1741,18 @@ def gcp_energy_pbc_numpy(Z: np.ndarray, xyz: np.ndarray, lat: np.ndarray, method
             M = int(tvecs.shape[0])
             Nn = int(Z.shape[0])
             # Precompute pair factors
-            z = np.arange(1, 37, dtype=np.float64)
+            z = np.arange(1, r0ab.shape[0] + 1, dtype=np.float64)
             zz15 = (z[:,None] * z[None,:]) ** 1.5
             r0fac = (0.7) * (r0ab.astype(np.float64) ** 0.75)
             ff = -(zz15 * 0.03)
             # Heuristic switch: small → loop; large → SoA vec
             if M * Nn < 40000:
-                gcp += float(_base_short_range_nb_pbc(Z.astype(np.int32), xyzb.astype(np.float64), latb.astype(np.float64), r0ab.astype(np.float64), 0.7, 0.03, 30.0, int(t1), int(t2), int(t3)))
+                gcp += float(_base_short_range_nb_pbc(Zm.astype(np.int32), xyzb.astype(np.float64), latb.astype(np.float64), r0ab.astype(np.float64), 0.7, 0.03, 30.0, int(t1), int(t2), int(t3)))
             else:
                 tvx, tvy, tvz = _split_tvecs(tvecs)
                 x, y, zc = _split_coords(xyzb.astype(np.float64))
-                validJ = np.where((Z >= 1) & (Z <= 18))[0].astype(np.int32)
-                gcp += float(_base_short_range_nb_pbc_vec_soa(Z.astype(np.int32), x, y, zc, tvx, tvy, tvz, validJ.astype(np.int32), r0fac.astype(np.float64), ff.astype(np.float64), 30.0))
+                validJ = np.where((Zm >= 1) & (Zm <= 18))[0].astype(np.int32)
+                gcp += float(_base_short_range_nb_pbc_vec_soa(Zm.astype(np.int32), x, y, zc, tvx, tvy, tvz, validJ.astype(np.int32), r0fac.astype(np.float64), ff.astype(np.float64), 30.0))
         return gcp
     # Fallback: not supported efficiently without numba; suggest enabling numba
     raise NotImplementedError('PBC gCP requires numba for performance in this build')
@@ -1696,16 +1771,24 @@ def gcp_energy_numpy(Z: np.ndarray, xyz: np.ndarray, method: str = 'b3lyp/def2sv
     if _opts__.srb:
         xyz_bohr = xyz * ANG2BOHR if units.lower().startswith('ang') else xyz
         r0ab = _load_r0ab_matrix()
+        Zm = _map_elements_for_params(Z)
         if _HAVE_NUMBA:
-            return float(_srb_energy_nb(Z.astype(np.int32), xyz_bohr.astype(np.float64), r0ab.astype(np.float64), float(_opts__.srb_rscal), float(_opts__.srb_qscal)))
+            return float(_srb_energy_nb(Zm.astype(np.int32), xyz_bohr.astype(np.float64), r0ab.astype(np.float64), float(_opts__.srb_rscal), float(_opts__.srb_qscal)))
         else:
-            return float(_srb_energy_only(Z, xyz_bohr, r0ab, _opts__.srb_rscal, _opts__.srb_qscal))
+            return float(_srb_energy_only(Zm, xyz_bohr, r0ab, _opts__.srb_rscal, _opts__.srb_qscal))
 
     params = _params_for_method(method)
     opts = _method_options(method)
     emiss = params.emiss
     nbas = params.nbas
     p1, p2, p3, p4 = params.p
+    # Map elements like Fortran does and pad arrays for safety
+    Zm = _map_elements_for_params(Z)
+    maxZ = int(np.max(Zm)) if Zm.size else 0
+    if emiss.size < maxZ:
+        emiss = np.pad(emiss, (0, maxZ - emiss.size), mode='constant', constant_values=0.0)
+    if nbas.size < maxZ:
+        nbas = np.pad(nbas.astype(np.int32), (0, maxZ - nbas.size), mode='constant', constant_values=0).astype(np.int32)
     if units.lower().startswith('ang'):
         xyz = xyz * ANG2BOHR
     N = int(Z.shape[0])
@@ -1713,18 +1796,19 @@ def gcp_energy_numpy(Z: np.ndarray, xyz: np.ndarray, method: str = 'b3lyp/def2sv
     opts = _method_options(method)
     za_tab, zb_tab = _setzet(p2, 1.0)
     shell = _SHELL
+    nZ = int(min(za_tab.size, shell.size))
     thrR = 60.0
     thrE = np.finfo(np.float64).eps
     if _HAVE_NUMBA and (not opts.base) and (not opts.srb):
         if not opts.damp:
-            return float(_gcp_energy_nb(Z.astype(np.int32), xyz.astype(np.float64), emiss.astype(np.float64), nbas.astype(np.int32), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE)))
+            return float(_gcp_energy_nb(Zm.astype(np.int32), xyz.astype(np.float64), emiss.astype(np.float64), nbas.astype(np.int32), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE)))
         else:
             # Precompute xva/xvb (handle special mTZVPP virtual counts)
             N = int(Z.shape[0])
             xva = np.empty(N, dtype=np.float64)
             special_xva = _normalize_method(method) in ('def2mtzvpp', 'mtzvpp', 'r2scan3c')
             for i in range(N):
-                zi = int(Z[i])
+                zi = int(Zm[i])
                 if special_xva:
                     val = 1.0
                     if zi == 6:
@@ -1736,15 +1820,15 @@ def gcp_energy_numpy(Z: np.ndarray, xyz: np.ndarray, method: str = 'b3lyp/def2sv
                     xva[i] = float(nbas[zi - 1]) - 0.5 * float(zi)
             xvb = xva.copy()
             r0ab = _load_r0ab_matrix()
-            return float(_gcp_energy_nb_damped(Z.astype(np.int32), xyz.astype(np.float64), emiss.astype(np.float64), xva.astype(np.float64), xvb.astype(np.float64), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE), r0ab.astype(np.float64), float(opts.dmp_scal), float(opts.dmp_exp)))
+            return float(_gcp_energy_nb_damped(Zm.astype(np.int32), xyz.astype(np.float64), emiss.astype(np.float64), xva.astype(np.float64), xvb.astype(np.float64), float(p1), float(p2), float(p3), float(p4), shell.astype(np.int32), za_tab.astype(np.float64), zb_tab.astype(np.float64), float(thrR), float(thrE), r0ab.astype(np.float64), float(opts.dmp_scal), float(opts.dmp_exp)))
 
     # xva/xvb per atom
     xva = np.empty(N, dtype=np.float64)
     special_xva = _normalize_method(method) in ('def2mtzvpp', 'mtzvpp', 'r2scan3c')
     for i in range(N):
-        zi = int(Z[i])
-        if zi < 1 or zi > 36:
-            raise ValueError('Element Z out of supported range [1..36]')
+        zi = int(Zm[i])
+        if zi < 1:
+            continue
         if special_xva:
             val = 1.0
             if zi == 6:
@@ -1753,7 +1837,7 @@ def gcp_energy_numpy(Z: np.ndarray, xyz: np.ndarray, method: str = 'b3lyp/def2sv
                 val = 0.5
             xva[i] = val
         else:
-            nvirt = float(nbas[zi - 1]) - 0.5 * float(zi)
+            nvirt = (float(nbas[zi - 1]) - 0.5 * float(zi)) if (zi - 1) < nbas.size else 0.0
             xva[i] = nvirt
     xvb = xva.copy()
     # Slater exponents
@@ -1768,15 +1852,15 @@ def gcp_energy_numpy(Z: np.ndarray, xyz: np.ndarray, method: str = 'b3lyp/def2sv
 
     ecp = 0.0
     for i in range(N):
-        zi = int(Z[i])
+        zi = int(Zm[i])
         va = xva[i]
-        if emiss[zi - 1] < 1e-7:
+        if (zi - 1) >= emiss.size or emiss[zi - 1] < 1e-7:
             continue
         ea = 0.0
         for j in range(N):
             if i == j:
                 continue
-            zj = int(Z[j])
+            zj = int(Zm[j])
             vb = xvb[j]
             if vb < 0.5:
                 continue
@@ -1786,6 +1870,8 @@ def gcp_energy_numpy(Z: np.ndarray, xyz: np.ndarray, method: str = 'b3lyp/def2sv
                 continue
             # Compute exponential and continue with Fortran-like thresholding
             expt = math.exp(-p3 * (r ** p4))
+            if (zi - 1) >= za_tab.size or (zj - 1) >= za_tab.size:
+                continue
             sab = _ssovl_one(r, int(shell[zi - 1]), int(shell[zj - 1]), float(za_tab[zi - 1]), float(zb_tab[zj - 1]))
             if abs(sab) <= 0.0 or math.sqrt(abs(sab)) < thrE:
                 continue
@@ -1821,132 +1907,109 @@ def _torch_sqrt_sab_table(p2: float, thrR: float, ngrid: int, device, dtype):
     import torch  # type: ignore
     return torch.as_tensor(sqrt_tab_np, device=device, dtype=dtype), float(dr), int(n2)
 
+if _HAVE_TORCH:
+    @torch.no_grad()  # type: ignore
+    def gcp_energy_torch(Z: 'torch.Tensor', xyz: 'torch.Tensor', method: str = 'b3lyp/def2svp', units: Literal['Angstrom','Bohr'] = 'Angstrom') -> 'torch.Tensor':  # type: ignore
+        """Torch front-end.
 
-@torch.no_grad()  # type: ignore
-def gcp_energy_torch(Z: 'torch.Tensor', xyz: 'torch.Tensor', method: str = 'b3lyp/def2svp', units: Literal['Angstrom','Bohr'] = 'Angstrom') -> 'torch.Tensor':  # type: ignore
-    """Torch front-end.
-
-    - If tensors are CUDA, tries a true GPU implementation for molecular gCP
-      (non-PBC) using sqrt(sab) lookup tables; supports damped and non-damped.
-    - Otherwise falls back to NumPy reference and returns a torch scalar.
-    """
-    if not _HAVE_TORCH:
-        raise RuntimeError('PyTorch not available')
-    import torch  # type: ignore
-    if Z.is_cuda and xyz.is_cuda:
-        # GPU molecular path
-        dev = xyz.device
-        dtype = torch.float64 if xyz.dtype != torch.float64 else xyz.dtype
-        params = _params_for_method(method)
-        opts = _method_options(method)
-        # For correctness, fall back to CPU for damped 3c-style methods
-        if opts.damp:
-            Z_np = Z.detach().cpu().to(torch.int32).numpy()
-            xyz_np = xyz.detach().cpu().double().numpy()
-            e = gcp_energy_numpy(Z_np, xyz_np, method=method, units=units)
-            return torch.as_tensor(e, dtype=xyz.dtype, device=xyz.device)
-        emiss_np = params.emiss
-        nbas_np = params.nbas
-        p1, p2, p3, p4 = params.p
-        thrR = 60.0
-        thrE = np.finfo(np.float64).eps
-        # Units to Bohr
-        if units.lower().startswith('ang'):
-            xyzb = xyz.to(dtype) * float(ANG2BOHR)
-        else:
-            xyzb = xyz.to(dtype)
-        N = int(Z.shape[0])
-        Zi = (Z.to(torch.int64) - 1)
-        # xva/xvb
-        nbas_t = torch.as_tensor(nbas_np, device=dev, dtype=dtype)
-        zvals = (Z.to(torch.int64)).to(dtype)
-        xva = nbas_t.index_select(0, Zi) - 0.5 * zvals
-        # Special xva for mTZVPP-family
-        if _normalize_method(method) in ('def2mtzvpp', 'mtzvpp', 'r2scan3c'):
-            one = torch.ones_like(xva)
-            xva = one
-            # C=6 → 3.0; N=7,O=8 → 0.5
-            xva = torch.where(Z == 6, torch.full_like(xva, 3.0), xva)
-            xva = torch.where((Z == 7) | (Z == 8), torch.full_like(xva, 0.5), xva)
-        xvb = xva.clone()
-        # emissivities
-        emiss_t = torch.as_tensor(emiss_np, device=dev, dtype=dtype)
-        emiss_i = emiss_t.index_select(0, Zi)
-        # Precompute sqrt(sab) table on device
-        sqrt_tab, dr, ngrid = _torch_sqrt_sab_table(float(p2), float(thrR), 2048, dev, dtype)
-        # Pair distances
-        x = xyzb[:, 0].view(N, 1) - xyzb[:, 0].view(1, N)
-        y = xyzb[:, 1].view(N, 1) - xyzb[:, 1].view(1, N)
-        zc = xyzb[:, 2].view(N, 1) - xyzb[:, 2].view(1, N)
-        r2 = x*x + y*y + zc*zc
-        iu = torch.triu_indices(N, N, offset=1, device=dev)
-        r = torch.sqrt(torch.clamp_min(r2[iu[0], iu[1]], 0))
-        # Mask by cutoff
-        maskR = (r <= thrR)
-        r = r[maskR]
-        I = iu[0][maskR]
-        J = iu[1][maskR]
-        if r.numel() == 0:
-            return torch.zeros((), device=dev, dtype=dtype)
-        # Table interpolation indices
-        xgrid = r / float(dr)
-        i0 = torch.clamp(xgrid.floor().to(torch.int64), 0, ngrid - 2)
-        t = (xgrid - i0.to(dtype))
-        Zi_idx = Zi[I]
-        Zj_idx = Zi[J]
-        v0 = sqrt_tab[Zi_idx, Zj_idx, i0]
-        v1 = sqrt_tab[Zi_idx, Zj_idx, i0 + 1]
-        sroot = (1.0 - t) * v0 + t * v1
-        # Exponential term
-        expt = torch.exp(-float(p3) * (r**float(p4)))
-        # vb per pair (both directions)
-        vb_j = xvb[J]
-        vb_i = xvb[I]
-        # Guard thresholds common to pair
-        sroot = torch.where(sroot > 0, sroot, torch.zeros_like(sroot))
-        mask_common = (sroot > thrE) & (expt > 1e-17)
-        if mask_common.any():
-            I2 = I[mask_common]
-            J2 = J[mask_common]
-            Zi2 = Zi_idx[mask_common]
-            Zj2 = Zj_idx[mask_common]
-            sroot2 = sroot[mask_common]
-            expt2 = expt[mask_common]
-            vbj2 = vb_j[mask_common]
-            vbi2 = vb_i[mask_common]
-            # Damping if requested
+        - If tensors are CUDA, tries a true GPU implementation for molecular gCP
+          (non-PBC) using sqrt(sab) lookup tables; supports damped and non-damped.
+        - Otherwise falls back to NumPy reference and returns a torch scalar.
+        """
+        import torch  # type: ignore
+        if Z.is_cuda and xyz.is_cuda:
+            # GPU molecular path (same as before)
+            dev = xyz.device
+            dtype = torch.float64 if xyz.dtype != torch.float64 else xyz.dtype
+            params = _params_for_method(method)
+            opts = _method_options(method)
             if opts.damp:
-                r0ab_np = _load_r0ab_matrix()
-                r0ab_t = torch.as_tensor(r0ab_np, device=dev, dtype=dtype)
-                r02 = r0ab_t[Zi2, Zj2]
-                rscal2 = r[mask_common] / r02
-                damp2 = (1.0 - 1.0 / (1.0 + float(opts.dmp_scal) * (rscal2 ** float(opts.dmp_exp))))
+                Z_np = Z.detach().cpu().to(torch.int32).numpy()
+                xyz_np = xyz.detach().cpu().double().numpy()
+                e = gcp_energy_numpy(Z_np, xyz_np, method=method, units=units)
+                return torch.as_tensor(e, dtype=xyz.dtype, device=xyz.device)
+            emiss_np = params.emiss
+            nbas_np = params.nbas
+            p1, p2, p3, p4 = params.p
+            thrR = 60.0
+            thrE = np.finfo(np.float64).eps
+            xyzb = xyz.to(dtype) * float(ANG2BOHR) if units.lower().startswith('ang') else xyz.to(dtype)
+            N = int(Z.shape[0])
+            Zi = (Z.to(torch.int64) - 1)
+            nbas_t = torch.as_tensor(nbas_np, device=dev, dtype=dtype)
+            zvals = (Z.to(torch.int64)).to(dtype)
+            xva = nbas_t.index_select(0, Zi) - 0.5 * zvals
+            if _normalize_method(method) in ('def2mtzvpp', 'mtzvpp', 'r2scan3c'):
+                xva = torch.where(Z == 6, torch.full_like(xva, 3.0), xva)
+                xva = torch.where((Z == 7) | (Z == 8), torch.full_like(xva, 0.5), xva)
+            xvb = xva.clone()
+            emiss_t = torch.as_tensor(emiss_np, device=dev, dtype=dtype)
+            emiss_i = emiss_t.index_select(0, Zi)
+            sqrt_tab, dr, ngrid = _torch_sqrt_sab_table(float(p2), float(thrR), 2048, dev, dtype)
+            x = xyzb[:, 0].view(N, 1) - xyzb[:, 0].view(1, N)
+            y = xyzb[:, 1].view(N, 1) - xyzb[:, 1].view(1, N)
+            zc = xyzb[:, 2].view(N, 1) - xyzb[:, 2].view(1, N)
+            r2 = x*x + y*y + zc*zc
+            iu = torch.triu_indices(N, N, offset=1, device=dev)
+            r = torch.sqrt(torch.clamp_min(r2[iu[0], iu[1]], 0))
+            maskR = (r <= thrR)
+            r = r[maskR]
+            I = iu[0][maskR]
+            J = iu[1][maskR]
+            if r.numel() == 0:
+                return torch.zeros((), device=dev, dtype=dtype)
+            xgrid = r / float(dr)
+            i0 = torch.clamp(xgrid.floor().to(torch.int64), 0, ngrid - 2)
+            t = (xgrid - i0.to(dtype))
+            Zi_idx = Zi[I]
+            Zj_idx = Zi[J]
+            v0 = sqrt_tab[Zi_idx, Zj_idx, i0]
+            v1 = sqrt_tab[Zi_idx, Zj_idx, i0 + 1]
+            sroot = (1.0 - t) * v0 + t * v1
+            expt = torch.exp(-float(p3) * (r**float(p4)))
+            vb_j = xvb[J]
+            vb_i = xvb[I]
+            sroot = torch.where(sroot > 0, sroot, torch.zeros_like(sroot))
+            mask_common = (sroot > thrE) & (expt > 1e-17)
+            if mask_common.any():
+                I2 = I[mask_common]; J2 = J[mask_common]
+                Zi2 = Zi_idx[mask_common]; Zj2 = Zj_idx[mask_common]
+                sroot2 = sroot[mask_common]; expt2 = expt[mask_common]
+                vbj2 = vb_j[mask_common]; vbi2 = vb_i[mask_common]
+                if opts.damp:
+                    r0ab_np = _load_r0ab_matrix()
+                    r0ab_t = torch.as_tensor(r0ab_np, device=dev, dtype=dtype)
+                    r02 = r0ab_t[Zi2, Zj2]
+                    rscal2 = r / r02; rscal2 = rscal2[mask_common]
+                    damp2 = (1.0 - 1.0 / (1.0 + float(opts.dmp_scal) * (rscal2 ** float(opts.dmp_exp))))
+                else:
+                    damp2 = 1.0
+                mask_j = (vbj2 > 0.5)
+                term1 = torch.zeros_like(expt2)
+                if mask_j.any():
+                    term1 = expt2[mask_j] / torch.sqrt(vbj2[mask_j]) / sroot2[mask_j]
+                    term1 = term1 * damp2 if isinstance(damp2, torch.Tensor) else term1 * damp2
+                    term1 = term1 * emiss_i[I2[mask_j]]
+                mask_i = (vbi2 > 0.5)
+                term2 = torch.zeros_like(expt2)
+                if mask_i.any():
+                    emiss_j = emiss_t.index_select(0, Zj2[mask_i])
+                    term2 = expt2[mask_i] / torch.sqrt(vbi2[mask_i]) / sroot2[mask_i]
+                    term2 = term2 * damp2 if isinstance(damp2, torch.Tensor) else term2 * damp2
+                    term2 = term2 * emiss_j
+                e_sum = term1.sum() + term2.sum()
             else:
-                damp2 = 1.0
-            # First term: i<-j contributions (requires vb_j>0.5)
-            mask_j = (vbj2 > 0.5)
-            term1 = torch.zeros_like(expt2)
-            if mask_j.any():
-                term1 = expt2[mask_j] / torch.sqrt(vbj2[mask_j]) / sroot2[mask_j]
-                term1 = term1 * damp2 if isinstance(damp2, torch.Tensor) else term1 * damp2
-                term1 = term1 * emiss_i[I2[mask_j]]
-            # Second term: j<-i contributions (requires vb_i>0.5)
-            mask_i = (vbi2 > 0.5)
-            term2 = torch.zeros_like(expt2)
-            if mask_i.any():
-                emiss_j = emiss_t.index_select(0, Zj2[mask_i])
-                term2 = expt2[mask_i] / torch.sqrt(vbi2[mask_i]) / sroot2[mask_i]
-                term2 = term2 * damp2 if isinstance(damp2, torch.Tensor) else term2 * damp2
-                term2 = term2 * emiss_j
-            e_sum = term1.sum() + term2.sum()
-        else:
-            e_sum = torch.zeros((), device=dev, dtype=dtype)
-        return (e_sum * float(p1)).to(xyz.dtype)
-    # CPU fallback (NumPy)
-    Z_np = Z.detach().cpu().to(torch.int32).numpy()
-    xyz_np = xyz.detach().cpu().double().numpy()
-    e = gcp_energy_numpy(Z_np, xyz_np, method=method, units=units)
-    return torch.as_tensor(e, dtype=xyz.dtype, device=xyz.device)
+                e_sum = torch.zeros((), device=dev, dtype=dtype)
+            return (e_sum * float(p1)).to(xyz.dtype)
+        # CPU fallback
+        import torch
+        Z_np = Z.detach().cpu().to(torch.int32).numpy()
+        xyz_np = xyz.detach().cpu().double().numpy()
+        e = gcp_energy_numpy(Z_np, xyz_np, method=method, units=units)
+        return torch.as_tensor(e, dtype=xyz.dtype, device=xyz.device)
+else:
+    def gcp_energy_torch(Z, xyz, method: str = 'b3lyp/def2svp', units: str = 'Angstrom'):
+        raise RuntimeError('PyTorch not available')
 
 
 __all__ = ['gcp_energy_numpy', 'gcp_energy_pbc_numpy', 'gcp_energy_torch']
@@ -2071,15 +2134,12 @@ def gcp_pbc_trace(Z: np.ndarray,
 if _HAVE_TORCH:
     import torch
 
-    def _torch_pair_tables(device, dtype):
-        z = torch.arange(1, 37, device=device, dtype=dtype)
-        zz = torch.sqrt(z[:, None] * z[None, :])
-        zz15 = (z[:, None] * z[None, :]) ** 1.5
-        return zz, zz15
-
     def _torch_r0fac_ff(Z, method_opts, r0ab_np, device, dtype, kind='srb'):
         r0ab = torch.as_tensor(r0ab_np, device=device, dtype=dtype)
-        zz, zz15 = _torch_pair_tables(device, dtype)
+        nZ = int(r0ab.shape[0])
+        z = torch.arange(1, nZ + 1, device=device, dtype=dtype)
+        zz = torch.sqrt(z[:, None] * z[None, :])
+        zz15 = (z[:, None] * z[None, :]) ** 1.5
         if kind == 'srb':
             ff = -(zz * float(method_opts.srb_qscal))
             r0fac = (float(method_opts.srb_rscal)) / r0ab
@@ -2178,6 +2238,9 @@ if _HAVE_TORCH:
         e_sum = e_sum + torch.where(mask0, ff0 * torch.exp(-a0), torch.zeros((), device=device, dtype=dtype)).sum()
 
         return e_sum
+else:
+    def gcp_energy_pbc_torch(Z, xyz, lat, method: str = 'b97-3c', units: str = 'Angstrom', image_chunk: int = 64):
+        raise RuntimeError('PyTorch not available')
 
 
 def _ssovl_debug(r: float, shell_i: int, shell_j: int, za: float, zb: float) -> dict:

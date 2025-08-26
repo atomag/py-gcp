@@ -21,7 +21,7 @@ def test_params_available():
     r0 = gt._load_r0ab_matrix()
     assert a.shape[0] == 36
     assert b.shape[0] == 36
-    assert r0.shape == (36, 36)
+    assert r0.shape[0] >= 36 and r0.shape[0] == r0.shape[1]
     assert r0[0, 0] > 0
 
 

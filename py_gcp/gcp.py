@@ -59,13 +59,20 @@ def _load_fortran_array(name: str, dtype=float) -> np.ndarray:
     return arr
 
 
-def _load_r0ab_matrix(max_elem: int = 36) -> np.ndarray:
+def _load_r0ab_matrix(max_elem: int | None = None) -> np.ndarray:
     data = _load_param_json()
     vals = data.get('r0ab_vals', [])
+    # Deduce size from triangular list length if not provided
+    if max_elem is None:
+        L = int(len(vals))
+        import math as _math
+        N = int((_math.isqrt(1 + 8 * L) - 1) // 2)
+    else:
+        N = int(max_elem)
     AUTOANG = 0.5291772083
-    r = np.zeros((max_elem, max_elem), dtype=np.float64)
+    r = np.zeros((N, N), dtype=np.float64)
     k = 0
-    for i in range(max_elem):
+    for i in range(N):
         for j in range(i + 1):
             v = vals[k] / AUTOANG
             r[i, j] = v
@@ -73,20 +80,9 @@ def _load_r0ab_matrix(max_elem: int = 36) -> np.ndarray:
             k += 1
     return r
 
-
-# Import the original implementation from the repository root (gcp_torch.py)
-# and adapt it to this module by reusing its source via relative import is not
-# possible here. Instead, we copy the public API by importing the existing
-# module if present. For packaging, this file mirrors gcp_torch functionality.
-
-# To avoid code duplication explosion, we import the repository implementation
-# dynamically when running from source. When installed as a package, this file
-# is the authoritative implementation (kept in sync during packaging).
-
-# NOTE: For brevity in this patch, we re-export from the original module when
-# available. In packaged wheels, this file should contain the full
-# implementation identical to gcp_torch.py with internal loaders pointing to
-# _load_fortran_array/_load_r0ab_matrix above.
+# Public API: import the in-package core implementation.
+# gcp_core contains the full implementation; this module re-exports its API
+# and provides lightweight helpers for loading packaged parameter data.
 
 from .gcp_core import (  # type: ignore
     gcp_energy_numpy,

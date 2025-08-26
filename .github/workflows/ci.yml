@@ -15,27 +15,65 @@ jobs:
       matrix:
         python-version: ["3.9", "3.10", "3.11"]
         torch: ["none", "cpu"]
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      BLIS_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+      OMP_PROC_BIND: "FALSE"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
       - name: Install PyTorch (CPU)
         if: matrix.torch == 'cpu'
         run: |
           python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
-      - name: Install package + test deps (no torch)
-        if: matrix.torch == 'none'
+      - name: Install package + test deps
         run: |
-          pip install -e .[ase]
-          pip install pytest
-      - name: Install package + test deps (with torch)
-        if: matrix.torch == 'cpu'
-        run: |
-          pip install -e .[ase,torch]
-          pip install pytest
+          pip install -r requirements.txt
       - name: Run tests
         run: pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    name: Build sdist/wheel and check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: |
+            pyproject.toml
+            MANIFEST.in
+      - name: Upgrade pip and install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+      - name: Build artifacts
+        run: python -m build
+      - name: Twine check
+        run: python -m twine check dist/*
+      - name: Install wheel and smoke test import
+        run: |
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import py_gcp
+          import py_gcp.gcp as g
+          assert hasattr(g, 'gcp_energy_numpy')
+          print('Import OK, API present')
+          PY
