@@ -10,6 +10,8 @@ It provides:
 
 ## Install
 
+Requires Python 3.10+.
+
 ```
 pip install ./
 ```
@@ -93,8 +95,4 @@ Units: Coordinates are accepted in Angstrom or Bohr; energy is returned in Hartr
 ## Development
 
 - Run tests: `pip install -e .[ase] pytest` then `pytest -q`.
-- Benchmarks: `python3 tools/bench_suite.py` (NumPy vs gcp64), `python3 tools/bench_torch_modes.py`.
-- Update params from Fortran (optional, for extended Z support):
-  - Obtain the upstream Fortran source (e.g., `gcp.f90`).
-  - Run: `python3 tools/extract_fortran_params.py /path/to/gcp.f90 -o py_gcp/data/fortran_params.json`
-  - This refreshes arrays like `ZS/ZP/ZD/SHELL` so py-gcp can build sqrt(sab) tables beyond Z=36.
+- Benchmarks: `python3 tools/bench_suite.py` (NumPy/torch vs gcp-fortran), `python3 tools/bench_torch_modes.py`.
